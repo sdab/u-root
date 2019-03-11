@@ -5,7 +5,7 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/u-root/dhcp4/dhcp4client"
@@ -29,159 +31,168 @@ var (
 )
 
 const (
-	kDhcpTimeout = 30*time.Second
-	kDhcpTries   = 5
+	dhcpTimeout = 15 * time.Second
+	dhcpTries   = 3
 )
 
-func leaseAndConfigureV4(iface netlink.Link, leased chan bool) (url.URL, net.IP, error) {
+type Lease interface {
+	Configure() error
+	Boot() (*url.URL, error)
+	Link() netlink.Link
+}
+
+func lease4(iface netlink.Link) (Lease, error) {
 	client, err := dhcp4client.New(iface,
-		dhcp4client.WithTimeout(kDhcpTimeout),
-		dhcp4client.WithRetry(kDhcpTries))
+		dhcp4client.WithTimeout(dhcpTimeout),
+		dhcp4client.WithRetry(dhcpTries))
 	if err != nil {
-		return url.URL{}, nil, err
+		return nil, err
 	}
 
 	log.Printf("Attempting to get DHCPv4 lease on %s", iface.Attrs().Name)
 	p, err := client.Request()
 	if err != nil {
-		return url.URL{}, nil, err
-	}
-	packet := dhclient.NewPacket4(p)
-	uri, err := packet.Boot()
-	if err != nil {
-		log.Printf("Got DHCPv4 lease, but no valid PXE information.")
-		return url.URL{}, nil, err
+		return nil, err
 	}
 
-	_, ok := <-leased
-	if !ok {
-		return url.URL{}, nil, errors.New("another DHCP request offer was acepted")
+	packet := dhclient.NewPacket4(iface, p)
+	if _, err := packet.Boot(); err != nil {
+		return nil, fmt.Errorf("valid DHCPv4 lease without PXE info: %v", err)
 	}
-	close(leased)
 
 	log.Printf("Got DHCPv4 lease on %s", iface.Attrs().Name)
-	return uri, packet.Lease().IP, dhclient.Configure4(iface, packet.P)
+	return packet, nil
 }
 
-func leaseAndConfigureV6 (iface netlink.Link, leased chan bool) (url.URL, net.IP, error) {
+func lease6(iface netlink.Link) (Lease, error) {
 	client, err := dhcp6client.New(iface,
-		dhcp6client.WithTimeout(kDhcpTimeout),
-		dhcp6client.WithRetry(kDhcpTries))
+		dhcp6client.WithTimeout(dhcpTimeout),
+		dhcp6client.WithRetry(dhcpTries))
 	if err != nil {
-		return url.URL{}, nil, err
+		return nil, err
 	}
 
 	log.Printf("Attempting to get DHCPv6 lease on %s", iface.Attrs().Name)
 	iana, p, err := client.RapidSolicit()
 	if err != nil {
-		return url.URL{}, nil, err
+		return nil, err
 	}
 
-	packet := dhclient.NewPacket6(p, iana)
-	uri, _, err := packet.Boot()
-	if err != nil {
-		log.Printf("Got DHCPv6 lease, but no valid PXE information.")
-		return url.URL{}, nil, err
+	packet := dhclient.NewPacket6(iface, p, iana)
+	if _, err := packet.Boot(); err != nil {
+		return nil, fmt.Errorf("valid DHCPv6 lease without PXE info: %v", err)
 	}
-
-	_, ok := <-leased
-	if !ok {
-		return url.URL{}, nil, errors.New("another DHCP request offer was acepted")
-	}
-	close(leased)
 
 	log.Printf("Got DHCPv6 lease on %s", iface.Attrs().Name)
-
-	return uri, packet.Lease().IP, dhclient.Configure6(iface, p, iana)
+	return packet, nil
 }
 
-func leaseAndConfigure (iface netlink.Link) (url.URL, net.IP, error) {
-	// leased has a message if no lease had been accepted. It is closed otherwise.
-	leased := make(chan bool, 1)
-	leased<-true
-
-	type dhcpResponse struct {
-		u url.URL
-		ip net.IP
-		err error
-	}
-
-	response := make(chan dhcpResponse)
-
-	leaseFunctions := []func(iface netlink.Link, leased chan bool) (url.URL, net.IP, error) {
-		leaseAndConfigureV4,
-		leaseAndConfigureV6,
-	}
-
-	for _, f := range leaseFunctions {
-		f := f
-		go func() {
-			u, ip, err := f(iface, leased)
-			response <- dhcpResponse{
-				u: u,
-				ip: ip,
-				err: err,
-			}
-		}()
-	}
-
-	errCount := 0
-
-	for r := range response {
-		// If we got a lease, we are all set.
-		// Note that one go routine will leak, but eventually timeout.
-		if r.err != nil {
-			return r.u, r.ip, nil
-		}
-		errCount++
-		// All attempts failed, report to caller.
-		if errCount == len(leaseFunctions) {
-			return url.URL{}, nil, errors.New("unable to get DHCP lease on IPv4 nor IPv6")
-		}
-	}
-	return url.URL{}, nil, errors.New("BUG: unreachable code")
-}
-
-func Netboot() error {
+// Netboot boots all interfaces matched by the regex in ifaceNames.
+func Netboot(ctx context.Context, ifaceNames string) error {
 	ifs, err := netlink.LinkList()
 	if err != nil {
 		return err
 	}
 
+	ifregex := regexp.MustCompilePOSIX(ifaceNames)
+
+	// Yeah, this is a hack, until we can cancel all leases in progress.
+	leases := make(chan Lease, 3*len(ifs))
+	defer close(leases)
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	for _, iface := range ifs {
-		// TODO: Do 'em all in parallel.
-		if iface.Attrs().Name != "eth0" {
+		if !ifregex.MatchString(iface.Attrs().Name) {
 			continue
 		}
 
-		uri, ip, err := leaseAndConfigure(iface)
-		if err != nil {
-			log.Printf("error while attempting DHCP on interface %v: %v", iface.Attrs().Name, err)
-			continue
-		}
+		wg.Add(1)
+		go func(iface netlink.Link) {
+			defer wg.Done()
 
-		log.Printf("Boot URI: %s", uri)
+			debug("Bringing up interface %s...", iface.Attrs().Name)
+			if _, err := dhclient.IfUp(iface.Attrs().Name); err != nil {
+				log.Printf("Could not bring up interface %s: %v", iface.Attrs().Name, err)
+				return
+			}
 
-		wd := &url.URL{
-			Scheme: uri.Scheme,
-			Host:   uri.Host,
-			Path:   path.Dir(uri.Path),
-		}
-		pc := pxe.NewConfig(wd)
-		if err := pc.FindConfigFile(iface.Attrs().HardwareAddr, ip); err != nil {
-			return fmt.Errorf("failed to parse pxelinux config: %v", err)
-		}
+			wg.Add(1)
+			go func(iface netlink.Link) {
+				defer wg.Done()
+				lease, err := lease4(iface)
+				if err == nil {
+					leases <- lease
+				}
+			}(iface)
 
-		label := pc.Entries[pc.DefaultEntry]
-		log.Printf("Got configuration: %s", label)
+			wg.Add(1)
+			go func(iface netlink.Link) {
+				defer wg.Done()
+				lease, err := lease6(iface)
+				if err == nil {
+					leases <- lease
+				}
+			}(iface)
+		}(iface)
+	}
 
-		if *dryRun {
-			label.ExecutionInfo(log.New(os.Stderr, "", log.LstdFlags))
-		} else if err := label.Execute(); err != nil {
-			log.Printf("Kexec error: %v", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case lease := <-leases:
+			if err := Boot(lease); err != nil {
+				log.Printf("Failed to boot lease %v: %v", lease, err)
+				continue
+			} else {
+				return nil
+			}
 		}
 	}
-	return nil
+}
+
+func Boot(lease Lease) error {
+	if err := lease.Configure(); err != nil {
+		return err
+	}
+
+	uri, err := lease.Boot()
+	if err != nil {
+		return err
+	}
+	log.Printf("Boot URI: %s", uri)
+
+	wd := &url.URL{
+		Scheme: uri.Scheme,
+		Host:   uri.Host,
+		Path:   path.Dir(uri.Path),
+	}
+	pc := pxe.NewConfig(wd)
+
+	// IP only makes sense for v4 anyway.
+	var ip net.IP
+	if p4, ok := lease.(*dhclient.Packet4); ok {
+		ip = p4.Lease().IP
+	}
+	if err := pc.FindConfigFile(lease.Link().Attrs().HardwareAddr, ip); err != nil {
+		return fmt.Errorf("failed to parse pxelinux config: %v", err)
+	}
+
+	label := pc.Entries[pc.DefaultEntry]
+	log.Printf("Got configuration: %s", label)
+
+	if *dryRun {
+		label.ExecutionInfo(log.New(os.Stderr, "", log.LstdFlags))
+		return nil
+	} else if err := label.Execute(); err != nil {
+		return fmt.Errorf("kexec of %v failed: %v", label, err)
+	}
+
+	// Kexec should either return an error or not return.
+	panic("unreachable")
 }
 
 func main() {
@@ -190,7 +201,9 @@ func main() {
 		debug = log.Printf
 	}
 
-	if err := Netboot(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), dhcpTries*dhcpTimeout)
+	defer cancel()
+	if err := Netboot(ctx, "eth0"); err != nil {
 		log.Fatal(err)
 	}
 }
