@@ -8,6 +8,7 @@ package dhclient
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -17,11 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mdlayher/dhcp6"
-	"github.com/mdlayher/dhcp6/dhcp6opts"
-	"github.com/u-root/dhcp4"
-	"github.com/u-root/dhcp4/dhcp4client"
-	"github.com/u-root/u-root/pkg/dhcp6client"
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
+	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
 	"github.com/vishvananda/netlink"
 )
 
@@ -53,7 +53,7 @@ func IfUp(ifname string) (netlink.Link, error) {
 }
 
 // Configure4 adds IP addresses, routes, and DNS servers to the system.
-func Configure4(iface netlink.Link, packet *dhcp4.Packet) error {
+func Configure4(iface netlink.Link, packet *dhcpv4.DHCPv4) error {
 	p := NewPacket4(iface, packet)
 
 	l := p.Lease()
@@ -91,8 +91,8 @@ func Configure4(iface netlink.Link, packet *dhcp4.Packet) error {
 }
 
 // Configure6 adds IPv6 addresses, routes, and DNS servers to the system.
-func Configure6(iface netlink.Link, packet *dhcp6.Packet, iana *dhcp6opts.IANA) error {
-	p := NewPacket6(iface, packet, iana)
+func Configure6(iface netlink.Link, packet *dhcpv6.Message) error {
+	p := NewPacket6(iface, packet)
 
 	l := p.Lease()
 	if l == nil {
@@ -102,11 +102,11 @@ func Configure6(iface netlink.Link, packet *dhcp6.Packet, iana *dhcp6opts.IANA) 
 	// Add the address to the iface.
 	dst := &netlink.Addr{
 		IPNet: &net.IPNet{
-			IP:   l.IP,
+			IP:   l.IPv6Addr,
 			Mask: net.IPMask(net.ParseIP("ffff:ffff:ffff:ffff::")),
 		},
-		PreferedLft: int(l.PreferredLifetime.Seconds()),
-		ValidLft:    int(l.ValidLifetime.Seconds()),
+		PreferedLft: int(l.PreferredLifetime),
+		ValidLft:    int(l.ValidLifetime),
 	}
 	if err := netlink.AddrReplace(iface, dst); err != nil {
 		if os.IsExist(err) {
@@ -138,16 +138,16 @@ type Lease interface {
 	Link() netlink.Link
 }
 
-func lease4(iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
-	client, err := dhcp4client.New(iface,
-		dhcp4client.WithTimeout(timeout),
-		dhcp4client.WithRetry(retries))
+func lease4(ctx context.Context, iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
+	client, err := nclient4.New(iface.Attrs().Name, iface.Attrs().HardwareAddr,
+		nclient4.WithTimeout(timeout),
+		nclient4.WithRetry(retries))
 	if err != nil {
 		return nil, err
 	}
 
 	log.Printf("Attempting to get DHCPv4 lease on %s", iface.Attrs().Name)
-	p, err := client.Request()
+	_, p, err := client.Request(ctx, dhcpv4.WithNetboot)
 	if err != nil {
 		return nil, err
 	}
@@ -161,21 +161,21 @@ func lease4(iface netlink.Link, timeout time.Duration, retries int) (Lease, erro
 	return packet, nil
 }
 
-func lease6(iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
-	client, err := dhcp6client.New(iface,
-		dhcp6client.WithTimeout(timeout),
-		dhcp6client.WithRetry(retries))
+func lease6(ctx context.Context, iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
+	client, err := nclient6.New(iface.Attrs().HardwareAddr,
+		nclient6.WithTimeout(timeout),
+		nclient6.WithRetry(retries))
 	if err != nil {
 		return nil, err
 	}
 
 	log.Printf("Attempting to get DHCPv6 lease on %s", iface.Attrs().Name)
-	iana, p, err := client.RapidSolicit()
+	p, _, err := client.Solicit(ctx, dhcpv6.WithRapidCommit, dhcpv6.WithNetboot)
 	if err != nil {
 		return nil, err
 	}
 
-	packet := NewPacket6(iface, p, iana)
+	packet := NewPacket6(iface, p)
 	if _, err := packet.Boot(); err != nil {
 		return nil, fmt.Errorf("valid DHCPv6 lease without PXE info: %v", err)
 	}
@@ -190,7 +190,7 @@ type Result struct {
 	Err       error
 }
 
-func SendRequests(ifs []netlink.Link, timeout time.Duration, retries int, ipv4, ipv6 bool) chan *Result {
+func SendRequests(ctx context.Context, ifs []netlink.Link, timeout time.Duration, retries int, ipv4, ipv6 bool) chan *Result {
 	// Yeah, this is a hack, until we can cancel all leases in progress.
 	r := make(chan *Result, 3*len(ifs))
 
@@ -210,7 +210,7 @@ func SendRequests(ifs []netlink.Link, timeout time.Duration, retries int, ipv4, 
 				wg.Add(1)
 				go func(iface netlink.Link) {
 					defer wg.Done()
-					lease, err := lease4(iface, timeout, retries)
+					lease, err := lease4(ctx, iface, timeout, retries)
 					r <- &Result{iface, lease, err}
 				}(iface)
 			}
@@ -219,7 +219,7 @@ func SendRequests(ifs []netlink.Link, timeout time.Duration, retries int, ipv4, 
 				wg.Add(1)
 				go func(iface netlink.Link) {
 					defer wg.Done()
-					lease, err := lease6(iface, timeout, retries)
+					lease, err := lease6(ctx, iface, timeout, retries)
 					r <- &Result{iface, lease, err}
 				}(iface)
 			}
@@ -230,6 +230,5 @@ func SendRequests(ifs []netlink.Link, timeout time.Duration, retries int, ipv4, 
 		wg.Wait()
 		close(r)
 	}()
-
 	return r
 }

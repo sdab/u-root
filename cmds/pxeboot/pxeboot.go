@@ -31,7 +31,7 @@ const (
 )
 
 // Netboot boots all interfaces matched by the regex in ifaceNames.
-func Netboot(ctx context.Context, ifaceNames string) error {
+func Netboot(ifaceNames string) error {
 	ifs, err := netlink.LinkList()
 	if err != nil {
 		return err
@@ -45,7 +45,10 @@ func Netboot(ctx context.Context, ifaceNames string) error {
 		}
 	}
 
-	r := dhclient.SendRequests(filteredIfs, dhcpTimeout, dhcpTries, true, true)
+	ctx, cancel := context.WithTimeout(context.Background(), dhcpTries*dhcpTimeout)
+	defer cancel()
+
+	r := dhclient.SendRequests(ctx, filteredIfs, dhcpTimeout, dhcpTries, true, true)
 
 	for {
 		select {
@@ -58,6 +61,7 @@ func Netboot(ctx context.Context, ifaceNames string) error {
 				return fmt.Errorf("nothing bootable found")
 			}
 			if result.Err == nil {
+				cancel()
 				if err := Boot(result.Lease); err != nil {
 					log.Printf("Failed to boot lease %v: %v", result.Lease, err)
 					continue
@@ -113,9 +117,7 @@ func Boot(lease dhclient.Lease) error {
 func main() {
 	flag.Parse()
 
-	ctx, cancel := context.WithTimeout(context.Background(), dhcpTries*dhcpTimeout)
-	defer cancel()
-	if err := Netboot(ctx, "eth0"); err != nil {
+	if err := Netboot("eth0"); err != nil {
 		log.Fatal(err)
 	}
 }
