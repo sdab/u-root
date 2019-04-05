@@ -5,12 +5,17 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/u-root/u-root/pkg/testutil"
 )
 
 func TestDmesg(t *testing.T) {
+	if uid := os.Getuid(); uid != 0 {
+		t.Skipf("test requires root on CircleCI, your uid is %d", uid)
+	}
+
 	cmd := testutil.Command(t)
 	out, err := cmd.Output()
 	if err != nil || len(out) == 0 {

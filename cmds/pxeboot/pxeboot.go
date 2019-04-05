@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -12,9 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"time"
 
-	"github.com/u-root/dhcp4/dhcp4client"
 	"github.com/u-root/u-root/pkg/boot"
 	"github.com/u-root/u-root/pkg/dhclient"
 	"github.com/u-root/u-root/pkg/ipxe"
@@ -23,28 +24,70 @@ import (
 )
 
 var (
-	verbose = flag.Bool("v", true, "print all kinds of things out, more than Chris wants")
-	dryRun  = flag.Bool("dry-run", false, "download kernel, but don't kexec it")
-	debug   = func(string, ...interface{}) {}
+	dryRun = flag.Bool("dry-run", false, "download kernel, but don't kexec it")
 )
 
-func attemptDHCPLease(iface netlink.Link, timeout time.Duration, retry int) (*dhclient.Packet4, error) {
-	if _, err := dhclient.IfUp(iface.Attrs().Name); err != nil {
-		return nil, err
+const (
+	dhcpTimeout = 15 * time.Second
+	dhcpTries   = 3
+)
+
+// Netboot boots all interfaces matched by the regex in ifaceNames.
+func Netboot(ifaceNames string) error {
+	ifs, err := netlink.LinkList()
+	if err != nil {
+		return err
 	}
 
-	client, err := dhcp4client.New(iface,
-		dhcp4client.WithTimeout(timeout),
-		dhcp4client.WithRetry(retry))
-	if err != nil {
-		return nil, err
+	var filteredIfs []netlink.Link
+	ifregex := regexp.MustCompilePOSIX(ifaceNames)
+	for _, iface := range ifs {
+		if ifregex.MatchString(iface.Attrs().Name) {
+			filteredIfs = append(filteredIfs, iface)
+		}
 	}
 
-	p, err := client.Request()
-	if err != nil {
-		return nil, err
+	ctx, cancel := context.WithTimeout(context.Background(), dhcpTries*dhcpTimeout)
+	defer cancel()
+
+	r := dhclient.SendRequests(ctx, filteredIfs, dhcpTimeout, dhcpTries, true, true)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case result, ok := <-r:
+			if !ok {
+				log.Printf("Configured all interfaces.")
+				return fmt.Errorf("nothing bootable found")
+			}
+			if result.Err != nil {
+				continue
+			}
+
+			img, err := Boot(result.Lease)
+			if err != nil {
+				log.Printf("Failed to boot lease %v: %v", result.Lease, err)
+				continue
+			}
+
+			// Cancel other DHCP requests in flight.
+			cancel()
+			log.Printf("Got configuration: %s", img)
+
+			if *dryRun {
+				img.ExecutionInfo(log.New(os.Stderr, "", log.LstdFlags))
+				return nil
+			}
+			if err := img.Execute(); err != nil {
+				return fmt.Errorf("kexec of %v failed: %v", img, err)
+			}
+
+			// Kexec should either return an error or not return.
+			panic("unreachable")
+		}
 	}
-	return dhclient.NewPacket4(p), nil
 }
 
 // getBootImage attempts to parse the file at uri as an ipxe config and returns
@@ -53,7 +96,6 @@ func attemptDHCPLease(iface netlink.Link, timeout time.Duration, retry int) (*dh
 func getBootImage(uri *url.URL, mac net.HardwareAddr, ip net.IP) (*boot.LinuxImage, error) {
 	// Attempt to read the given boot path as an ipxe config file.
 	if ipc, err := ipxe.NewConfig(uri); err == nil {
-		log.Printf("Got configuration: %s", ipc.BootImage)
 		return ipc.BootImage, nil
 	}
 
@@ -70,70 +112,33 @@ func getBootImage(uri *url.URL, mac net.HardwareAddr, ip net.IP) (*boot.LinuxIma
 	}
 
 	label := pc.Entries[pc.DefaultEntry]
-	log.Printf("Got configuration: %s", label)
 	return label, nil
 }
 
-func Netboot() error {
-	ifs, err := netlink.LinkList()
+func Boot(lease dhclient.Lease) (*boot.LinuxImage, error) {
+	if err := lease.Configure(); err != nil {
+		return nil, err
+	}
+
+	uri, err := lease.Boot()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	log.Printf("Boot URI: %s", uri)
 
-	for _, iface := range ifs {
-		// TODO: Do 'em all in parallel.
-		if iface.Attrs().Name != "eth0" {
-			continue
-		}
-
-		log.Printf("Attempting to get DHCP lease on %s", iface.Attrs().Name)
-		packet, err := attemptDHCPLease(iface, 30*time.Second, 5)
-		if err != nil {
-			log.Printf("No lease on %s: %v", iface.Attrs().Name, err)
-			continue
-		}
-		log.Printf("Got lease on %s", iface.Attrs().Name)
-		if err := dhclient.Configure4(iface, packet.P); err != nil {
-			log.Printf("shit: %v", err)
-			continue
-		}
-
-		// We may have to make this DHCPv6 and DHCPv4-specific anyway.
-		// Only tested with v4 right now; and assuming the uri points
-		// to a pxelinux.0.
-		//
-		// Or rather, we need to make this option-specific. DHCPv6 has
-		// options for passing a kernel and cmdline directly. v4
-		// usually just passes a pxelinux.0. But what about an initrd?
-		uri, err := packet.Boot()
-		if err != nil {
-			log.Printf("Got DHCP lease, but no valid PXE information.")
-			continue
-		}
-
-		log.Printf("Boot URI: %s", uri)
-
-		img, err := getBootImage(uri, iface.Attrs().HardwareAddr, packet.Lease().IP)
-		if err != nil {
-			return err
-		}
-
-		if *dryRun {
-			img.ExecutionInfo(log.New(os.Stderr, "", log.LstdFlags))
-		} else if err := img.Execute(); err != nil {
-			log.Printf("Kexec error: %v", err)
-		}
+	// IP only makes sense for v4 anyway, because the PXE probing of files
+	// uses a MAC address and an IPv4 address to look at files.
+	var ip net.IP
+	if p4, ok := lease.(*dhclient.Packet4); ok {
+		ip = p4.Lease().IP
 	}
-	return nil
+	return getBootImage(uri, lease.Link().Attrs().HardwareAddr, ip)
 }
 
 func main() {
 	flag.Parse()
-	if *verbose {
-		debug = log.Printf
-	}
 
-	if err := Netboot(); err != nil {
+	if err := Netboot("eth0"); err != nil {
 		log.Fatal(err)
 	}
 }

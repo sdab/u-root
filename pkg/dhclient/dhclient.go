@@ -8,15 +8,21 @@ package dhclient
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
+	"net/url"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
 	"github.com/mdlayher/dhcp6"
 	"github.com/mdlayher/dhcp6/dhcp6opts"
-	"github.com/u-root/dhcp4"
+	"github.com/u-root/u-root/pkg/dhcp6client"
 	"github.com/vishvananda/netlink"
 )
 
@@ -48,46 +54,14 @@ func IfUp(ifname string) (netlink.Link, error) {
 }
 
 // Configure4 adds IP addresses, routes, and DNS servers to the system.
-func Configure4(iface netlink.Link, packet *dhcp4.Packet) error {
-	p := NewPacket4(packet)
-
-	l := p.Lease()
-	if l == nil {
-		return fmt.Errorf("no lease returned")
-	}
-
-	// Add the address to the iface.
-	dst := &netlink.Addr{
-		IPNet: l,
-	}
-	if err := netlink.AddrReplace(iface, dst); err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("add/replace %s to %v: %v", dst, iface, err)
-		}
-	}
-
-	if gw := p.Gateway(); gw != nil {
-		r := &netlink.Route{
-			LinkIndex: iface.Attrs().Index,
-			Gw:        gw,
-		}
-
-		if err := netlink.RouteReplace(r); err != nil {
-			return fmt.Errorf("%s: add %s: %v", iface.Attrs().Name, r, err)
-		}
-	}
-
-	if ips := p.DNS(); ips != nil {
-		if err := WriteDNSSettings(ips); err != nil {
-			return err
-		}
-	}
-	return nil
+func Configure4(iface netlink.Link, packet *dhcpv4.DHCPv4) error {
+	p := NewPacket4(iface, packet)
+	return p.Configure()
 }
 
 // Configure6 adds IPv6 addresses, routes, and DNS servers to the system.
 func Configure6(iface netlink.Link, packet *dhcp6.Packet, iana *dhcp6opts.IANA) error {
-	p := NewPacket6(packet, iana)
+	p := NewPacket6(iface, packet, iana)
 
 	l := p.Lease()
 	if l == nil {
@@ -124,4 +98,98 @@ func WriteDNSSettings(ips []net.IP) error {
 		rc.WriteString(fmt.Sprintf("nameserver %s\n", ip))
 	}
 	return ioutil.WriteFile("/etc/resolv.conf", rc.Bytes(), 0644)
+}
+
+type Lease interface {
+	fmt.Stringer
+	Configure() error
+	Boot() (*url.URL, error)
+	Link() netlink.Link
+}
+
+func lease4(ctx context.Context, iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
+	client, err := nclient4.New(iface.Attrs().Name, iface.Attrs().HardwareAddr,
+		nclient4.WithTimeout(timeout),
+		nclient4.WithRetry(retries))
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Attempting to get DHCPv4 lease on %s", iface.Attrs().Name)
+	_, p, err := client.Request(ctx, dhcpv4.WithNetboot)
+	if err != nil {
+		return nil, err
+	}
+
+	packet := NewPacket4(iface, p)
+	log.Printf("Got DHCPv4 lease on %s", iface.Attrs().Name)
+	return packet, nil
+}
+
+func lease6(iface netlink.Link, timeout time.Duration, retries int) (Lease, error) {
+	client, err := dhcp6client.New(iface,
+		dhcp6client.WithTimeout(timeout),
+		dhcp6client.WithRetry(retries))
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Attempting to get DHCPv6 lease on %s", iface.Attrs().Name)
+	iana, p, err := client.RapidSolicit()
+	if err != nil {
+		return nil, err
+	}
+
+	packet := NewPacket6(iface, p, iana)
+	log.Printf("Got DHCPv6 lease on %s", iface.Attrs().Name)
+	return packet, nil
+}
+
+type Result struct {
+	Interface netlink.Link
+	Lease     Lease
+	Err       error
+}
+
+func SendRequests(ctx context.Context, ifs []netlink.Link, timeout time.Duration, retries int, ipv4, ipv6 bool) chan *Result {
+	// Yeah, this is a hack, until we can cancel all leases in progress.
+	r := make(chan *Result, 3*len(ifs))
+
+	var wg sync.WaitGroup
+	for _, iface := range ifs {
+		wg.Add(1)
+		go func(iface netlink.Link) {
+			defer wg.Done()
+
+			log.Printf("Bringing up interface %s...", iface.Attrs().Name)
+			if _, err := IfUp(iface.Attrs().Name); err != nil {
+				log.Printf("Could not bring up interface %s: %v", iface.Attrs().Name, err)
+				return
+			}
+
+			if ipv4 {
+				wg.Add(1)
+				go func(iface netlink.Link) {
+					defer wg.Done()
+					lease, err := lease4(ctx, iface, timeout, retries)
+					r <- &Result{iface, lease, err}
+				}(iface)
+			}
+
+			if ipv6 {
+				wg.Add(1)
+				go func(iface netlink.Link) {
+					defer wg.Done()
+					lease, err := lease6(iface, timeout, retries)
+					r <- &Result{iface, lease, err}
+				}(iface)
+			}
+		}(iface)
+	}
+
+	go func() {
+		wg.Wait()
+		close(r)
+	}()
+	return r
 }
